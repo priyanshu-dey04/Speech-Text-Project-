@@ -1,320 +1,327 @@
-import axios from "axios";
-
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
-
-
+// src/App.jsx
 import React, { useState, useRef, useEffect } from "react";
-import { supabase } from "./supabaseClient";
+import { supabase } from "./supabaseClient"; // <- your supabase client file
 import axios from "axios";
+import "./index.css"; // ensure Tailwind is imported
+
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 export default function App() {
-  // app state
+  // UI state
   const [user, setUser] = useState(null);
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [file, setFile] = useState(null);
-  const [status, setStatus] = useState({ type: null, text: "" });
-  const [history, setHistory] = useState([]);
   const [isRecording, setIsRecording] = useState(false);
-  const mediaRecorderRef = useRef(null);
-  const chunksRef = useRef([]);
+  const [transcript, setTranscript] = useState("");
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
 
-  // load session on mount
+  const mediaRecorderRef = useRef(null);
+  const recordedChunksRef = useRef([]);
+
+  // On mount: check Supabase auth session
   useEffect(() => {
-    (async () => {
-      const { data } = await supabase.auth.getSession();
+    const s = supabase.auth.getSession().then(({ data }) => {
       if (data?.session?.user) setUser(data.session.user);
-      // listen for changes
-      supabase.auth.onAuthStateChange((_event, session) => {
-        setUser(session?.user ?? null);
-      });
-    })();
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+
+    // cleanup subscription
+    return () => sub?.subscription?.unsubscribe?.();
   }, []);
 
-  // --- Auth functions ---
-  async function signUp() {
-    setStatus({ type: "info", text: "Signing up..." });
-    const { error } = await supabase.auth.signUp({ email, password });
-    if (error) setStatus({ type: "error", text: error.message });
-    else setStatus({ type: "success", text: "Check your email to confirm." });
-  }
-
-  async function signIn() {
-    setStatus({ type: "info", text: "Signing in..." });
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) setStatus({ type: "error", text: error.message });
-    else {
-      setUser(data.session.user);
-      setStatus({ type: "success", text: "Signed in" });
-      loadHistory(); // auto-load after sign in
+  // --- Auth helpers ---
+  async function signInWithEmail(email) {
+    setError(null);
+    try {
+      const { error } = await supabase.auth.signInWithOtp({ email });
+      if (error) throw error;
+      alert("Magic link sent to your email. Check inbox/spam.");
+    } catch (err) {
+      setError(err.message || String(err));
     }
   }
 
   async function signOut() {
     await supabase.auth.signOut();
     setUser(null);
-    setHistory([]);
-    setStatus({ type: "info", text: "Signed out" });
   }
 
-  // --- Recording handlers ---
-  function startRecording() {
-    setStatus({ type: "info", text: "Requesting mic..." });
-    navigator.mediaDevices.getUserMedia({ audio: true })
-      .then(stream => {
-        const mr = new MediaRecorder(stream);
-        mediaRecorderRef.current = mr;
-        chunksRef.current = [];
-        mr.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-        mr.onstop = async () => {
-          const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-          const f = new File([blob], `record-${Date.now()}.webm`, { type: "audio/webm" });
-          setFile(f);
-          setStatus({ type: "info", text: "Recording saved — uploading..." });
-          await uploadFileToServer(f);
-        };
-        mr.start();
-        setIsRecording(true);
-        setStatus({ type: "info", text: "Recording..." });
-      })
-      .catch(err => setStatus({ type: "error", text: "Mic permission denied" }));
+  // --- Recording ---
+  async function startRecording() {
+    setError(null);
+    setTranscript("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorderRef.current = new MediaRecorder(stream);
+      recordedChunksRef.current = [];
+
+      mediaRecorderRef.current.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+
+      mediaRecorderRef.current.onstop = async () => {
+        const blob = new Blob(recordedChunksRef.current, { type: "audio/webm" });
+        // Create a File so server or Supabase can treat it like an uploaded file
+        const recordedFile = new File([blob], `record-${Date.now()}.webm`, { type: blob.type });
+        setFile(recordedFile);
+        // optionally autoproc: await uploadAndTranscribe(recordedFile);
+      };
+
+      mediaRecorderRef.current.start();
+      setIsRecording(true);
+    } catch (err) {
+      setError("Mic permission denied or device not available.");
+    }
   }
 
   function stopRecording() {
-    mediaRecorderRef.current?.stop();
-    setIsRecording(false);
+    try {
+      mediaRecorderRef.current?.stop();
+      mediaRecorderRef.current?.stream?.getTracks?.().forEach((t) => t.stop());
+    } catch (err) {
+      // ignore
+    } finally {
+      setIsRecording(false);
+    }
   }
 
-  // --- file input ---
+  // --- File input handler ---
   function handleFileSelect(e) {
     const f = e.target.files?.[0];
     if (!f) return;
     setFile(f);
+    setTranscript("");
+    setError(null);
   }
 
-  // --- Upload flow: upload file to Supabase Storage (private), get signed url, send to backend for Deepgram ---
-  async function uploadFileToServer(f) {
+  // --- Upload & transcribe ---
+  // Two modes supported:
+  // 1) send file directly to backend (multipart/form-data)
+  // 2) if you already uploaded to Supabase storage elsewhere and have storagePath -> send storagePath
+  async function uploadAndTranscribe(selectedFile) {
+    setError(null);
+    setLoading(true);
+    setTranscript("");
     try {
-      if (!user) return setStatus({ type: "error", text: "Please sign in first." });
+      if (!selectedFile) throw new Error("No file selected.");
 
-      setStatus({ type: "info", text: "Uploading file to storage..." });
+      // Build form - backend expects 'audio' file (multipart)
+      const form = new FormData();
+      form.append("audio", selectedFile);
 
-      const path = `${user.id}/${Date.now()}_${f.name}`;
-      const { error: uploadErr } = await supabase.storage.from("uploads").upload(path, f, {
-        cacheControl: "3600",
-        upsert: false,
-        contentType: f.type
+      // If you want to send user id, add it
+      if (user?.id) form.append("userId", user.id);
+
+      const res = await axios.post(`${API_BASE}/api/transcribe`, form, {
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: 120000,
       });
 
-      if (uploadErr) throw uploadErr;
+      const data = res.data ?? {};
+      if (data.error) {
+        throw new Error(data.error || "Transcription failed");
+      }
 
-      // create a short-lived signed url to let the backend fetch the file
-      const { data: signed, error: signedErr } = await supabase.storage.from("uploads").createSignedUrl(path, 120);
-      if (signedErr) throw signedErr;
-
-      setStatus({ type: "info", text: "Sending to transcribe service..." });
-
-      // get JWT to pass to backend if you want backend to verify user (optional)
-      const { data: sessData } = await supabase.auth.getSession();
-      const token = sessData?.session?.access_token;
-
-      // call backend transcribe route (replace with your backend url)
-      const res = await axios.post(
-  "https://speech-text-project.onrender.com/api/transcribe",
-  {
-    audioUrl: signed.signedUrl,
-    storagePath: path
-  },
-  {
-    headers: { "Content-Type": "application/json" }
-  }
-);
-
-
-      setStatus({ type: "success", text: "Transcribed & saved." });
-      // add to history quickly
-      loadHistory();
-
+      setTranscript(data.transcript ?? data.result ?? "");
+      // Optionally show saved history if backend saved to DB
+      if (data.history) setHistory(data.history);
     } catch (err) {
-      console.error(err);
-      const msg = err?.response?.data?.error || err?.message || JSON.stringify(err);
-      setStatus({ type: "error", text: String(msg) });
+      // Show friendly message and console for debugging
+      const msg = err?.response?.data?.error || err.message || String(err);
+      setError(msg);
+      console.error("Upload/transcribe error:", err);
+    } finally {
+      setLoading(false);
     }
   }
 
-  // --- load history (server-side) ---
+  // --- Fetch history from backend (if server returns list) ---
   async function loadHistory() {
+    setError(null);
+    setLoading(true);
     try {
-      if (!user) return setStatus({ type: "error", text: "Sign in to load history" });
-      setStatus({ type: "info", text: "Loading history..." });
-      const { data: sessData } = await supabase.auth.getSession();
-      const token = sessData?.session?.access_token;
-
-      const res = await axios.get("http://localhost:5000/api/transcriptions", {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-
-      setHistory(res.data.data || []);
-      setStatus({ type: null, text: "" });
+      const res = await axios.get(`${API_BASE}/api/transcriptions`, { timeout: 15000 });
+      setHistory(Array.isArray(res.data) ? res.data : []);
     } catch (err) {
+      setError("Failed to load history.");
       console.error(err);
-      setStatus({ type: "error", text: "Failed to load history." });
+    } finally {
+      setLoading(false);
     }
   }
 
+  // Convenience: clear file
+  function clearSelected() {
+    setFile(null);
+    setTranscript("");
+    setError(null);
+    recordedChunksRef.current = [];
+  }
+
+  // --- Minimal UI / layout ---
   return (
-    <div className="min-h-screen flex items-start justify-center py-12 px-6">
-      <div className="w-full max-w-5xl">
-        {/* header */}
-        <header className="flex items-center justify-between mb-6">
-          <div>
-            <h1 className="text-3xl font-bold kicker">Speech to Text</h1>
-            <div className="text-sm text-muted">Device-first • Responsive • Animated</div>
-          </div>
-
-          <div className="flex items-center gap-3">
-            {!user ? (
-              <button className="btn-3d btn-ghost text-sm" onClick={() => setStatus({ type: "info", text: "Use the Sign In panel below." })}>
-                Docs
-              </button>
-            ) : (
-              <div className="text-sm text-muted pr-3">Signed in: <span className="font-medium">{user.email}</span></div>
-            )}
-            <button className="btn-3d btn-primary text-sm" onClick={() => { /* open docs or route */ }}>
-              <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
-              Action
-            </button>
-          </div>
-        </header>
-
-        {/* main layout */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {/* left: hero + actions */}
-          <section className="md:col-span-2 card-3d p-6">
-            <div className="flex items-start gap-6">
-              <div>
-                {/* mic circle */}
-                <div
-                  onClick={() => (isRecording ? stopRecording() : startRecording())}
-                  className={`mic-circle ${isRecording ? "recording" : ""}`}
-                  aria-label="Record"
-                >
-                  {/* mic icon */}
-                  {!isRecording ? (
-                    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z" fill="white" /><path d="M19 11a1 1 0 0 0-2 0 5 5 0 0 1-10 0 1 1 0 0 0-2 0 5 5 0 0 0 4 4.9V18h-3a1 1 0 0 0 0 2h10a1 1 0 0 0 0-2h-3v-2.1A5 5 0 0 0 19 11z" fill="white"/></svg>
-                  ) : (
-                    <svg width="36" height="36" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8" fill="#ff4d6d" /></svg>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex-1">
-                <h2 className="text-2xl font-semibold mb-1">Talk. Transcribe. Save.</h2>
-                <p className="text-muted mb-4">Record with your device or upload audio files — transcriptions appear instantly and are stored securely.</p>
-
-                <div className="flex items-center gap-3">
-                  <label className="cursor-pointer">
-                    <input type="file" accept="audio/*" onChange={handleFileSelect} className="sr-only" />
-                    <span className="btn-3d btn-ghost">Choose file</span>
-                  </label>
-
-                  <button
-                    className="btn-3d btn-primary"
-                    onClick={() => file ? uploadFileToServer(file) : setStatus({ type: "error", text: "No file selected" })}
-                  >
-                    Upload & Transcribe
-                  </button>
-
-                  <button className="btn-3d" onClick={() => setStatus({ type: null, text: "" })}>
-                    Clear
-                  </button>
-                </div>
-
-                {/* status card */}
-                <div className="mt-4">
-                  {status.type === "error" && <div className="p-3 rounded-md bg-rose-900/30 border border-rose-600 text-rose-200"><strong>Error:</strong> {status.text}</div>}
-                  {status.type === "info" && <div className="p-3 rounded-md bg-slate-800/50 border border-slate-700 text-slate-200">{status.text}</div>}
-                  {status.type === "success" && <div className="p-3 rounded-md bg-emerald-900/30 border border-emerald-600 text-emerald-200">{status.text}</div>}
-                </div>
-              </div>
-            </div>
-          </section>
-
-          {/* right: sign-in / history */}
-          <aside className="space-y-4">
-            {/* Sign In Card */}
-            <div className="card-3d p-4">
-              <h3 className="text-lg font-semibold mb-2">Sign In</h3>
-              {!user ? (
-                <>
-                  <input className="input-surface w-full mb-2" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} />
-                  <input className="input-surface w-full mb-3" placeholder="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} />
-                  <div className="flex gap-2">
-                    <button className="btn-3d btn-primary w-full" onClick={signIn}>Sign In</button>
-                    <button className="btn-3d btn-ghost w-full" onClick={signUp}>Sign Up</button>
-                  </div>
-                </>
-              ) : (
-                <div>
-                  <div className="text-sm text-muted mb-2">Signed in as</div>
-                  <div className="font-medium mb-3">{user.email}</div>
-                  <button className="btn-3d w-full btn-ghost" onClick={signOut}>Sign Out</button>
-                </div>
-              )}
-            </div>
-
-            {/* History */}
-            <div className="card-3d p-4">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-lg font-semibold">History</h3>
-                <button className="text-sm text-muted" onClick={loadHistory}>Refresh</button>
-              </div>
-
-              <div className="space-y-3">
-                {history.length === 0 ? (
-                  <div className="text-sm text-muted">No transcriptions yet.</div>
-                ) : (
-                  history.map(h => (
-                    <div key={h.id} className="p-3 card-3d border border-slate-700">
-                      <div className="text-sm mb-2">{h.transcription}</div>
-                      <div className="text-xs text-muted">{h.filename} • {new Date(h.created_at).toLocaleString()}</div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-
-            {/* Small tips */}
-            <div className="card-3d p-3 text-sm text-muted">
-              Tip: Click the mic circle to start/stop recording. Sign in to save and view your history.
-            </div>
-          </aside>
+    <div className="min-h-screen bg-gradient-to-b from-slate-900 to-slate-800 text-slate-100 antialiased">
+      <header className="max-w-5xl mx-auto p-6 flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-extrabold tracking-tight">Speech to Text</h1>
+          <p className="text-sm text-slate-400">Device-first • Responsive • Animated</p>
         </div>
-      </div>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => alert("Docs: show project docs or link")}
+            className="bg-slate-700/40 px-3 py-1 rounded hover:bg-slate-700 transition"
+          >
+            Docs
+          </button>
+
+          {user ? (
+            <div className="text-right">
+              <div className="text-xs text-slate-300">Signed in:</div>
+              <div className="text-sm flex items-center gap-2">
+                <span className="font-medium">{user.email ?? user.user_metadata?.email ?? "User"}</span>
+                <button
+                  onClick={signOut}
+                  className="ml-2 bg-rose-600 text-white px-2 py-1 rounded shadow hover:opacity-90"
+                >
+                  Sign Out
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="text-sm">
+              <button
+                onClick={() => {
+                  const email = prompt("Enter your email for magic-link sign in:");
+                  if (email) signInWithEmail(email);
+                }}
+                className="bg-emerald-600 px-3 py-1 rounded hover:brightness-105"
+              >
+                Sign In
+              </button>
+            </div>
+          )}
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto p-6 grid gap-8">
+        {/* Hero */}
+        <section className="flex flex-col md:flex-row items-start gap-6">
+          <div className="w-full md:w-1/3 flex flex-col items-center">
+            {/* 3D mic button */}
+            <div
+              onClick={() => (isRecording ? stopRecording() : startRecording())}
+              className={`group w-36 h-36 rounded-full flex items-center justify-center cursor-pointer transform transition-all
+                ${isRecording ? "scale-95 ring-8 ring-rose-500/20" : "hover:scale-105"}
+                bg-gradient-to-br from-slate-800 to-slate-700 shadow-2xl`}
+              title={isRecording ? "Stop recording" : "Start recording"}
+            >
+              <div
+                className={`w-24 h-24 rounded-full bg-slate-900 flex items-center justify-center text-white text-2xl shadow-inner transition-transform
+                  ${isRecording ? "animate-pulse translate-y-0" : "group-hover:-translate-y-1"}`}
+              >
+                🎤
+              </div>
+            </div>
+
+            <div className="mt-4 text-sm text-slate-400 text-center">
+              <div className="font-semibold">{isRecording ? "Recording…" : "Tap mic to record"}</div>
+              <div className="mt-1">Click the mic to start/stop recording. File will appear below.</div>
+            </div>
+          </div>
+
+          <div className="w-full md:w-2/3 bg-slate-900/40 p-4 rounded-lg shadow-lg">
+            <h2 className="text-xl font-semibold">Talk. Transcribe. Save.</h2>
+            <p className="text-sm text-slate-400 mt-1">
+              Record with your device or upload audio files — transcriptions appear instantly and are stored
+              securely (if backend saves them).
+            </p>
+
+            <div className="mt-4 flex gap-3 items-center">
+              <label className="bg-slate-700 px-3 py-2 rounded text-sm cursor-pointer hover:bg-slate-600">
+                Choose file
+                <input onChange={handleFileSelect} type="file" accept="audio/*" className="hidden" />
+              </label>
+
+              <button
+                disabled={!file || loading}
+                onClick={() => uploadAndTranscribe(file)}
+                className="bg-emerald-500 hover:bg-emerald-600 disabled:opacity-50 px-3 py-2 rounded text-sm"
+              >
+                Upload & Transcribe
+              </button>
+
+              <button onClick={clearSelected} className="bg-slate-700 px-3 py-2 rounded text-sm hover:bg-slate-600">
+                Clear
+              </button>
+
+              <div className="ml-auto text-sm text-slate-400">{loading ? "Processing..." : ""}</div>
+            </div>
+
+            {file && (
+              <div className="mt-3 text-sm text-slate-200 bg-slate-800 p-2 rounded">
+                <strong>Selected:</strong> {file.name} • {Math.round((file.size / 1024) * 10) / 10} KB
+              </div>
+            )}
+
+            {error && (
+              <div className="mt-3 text-sm text-rose-300 bg-rose-900/10 p-2 rounded">
+                <strong>Error:</strong> {String(error)}
+              </div>
+            )}
+
+            {transcript && (
+              <div className="mt-4 p-3 bg-gradient-to-r from-slate-800/60 to-slate-700/60 rounded border border-slate-700">
+                <h3 className="font-semibold">Transcript</h3>
+                <p className="mt-2 text-slate-100 whitespace-pre-wrap">{transcript}</p>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* History */}
+        <section className="bg-slate-900/40 p-4 rounded-lg shadow-lg">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold">History</h3>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={loadHistory}
+                className="bg-slate-700 px-3 py-1 rounded hover:bg-slate-600 text-sm disabled:opacity-50"
+              >
+                Refresh
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-3">
+            {history.length === 0 ? (
+              <div className="text-slate-400 text-sm">No transcriptions yet. Sign in to save and view your history.</div>
+            ) : (
+              <div className="grid gap-3">
+                {history.map((h, idx) => (
+                  <article key={idx} className="p-3 bg-slate-800/60 rounded border border-slate-700">
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <div className="font-medium">{h.title || `Entry ${idx + 1}`}</div>
+                        <div className="text-xs text-slate-400 mt-1">{new Date(h.created_at).toLocaleString()}</div>
+                      </div>
+                      <div className="text-xs text-slate-300">{h.duration ? `${h.duration}s` : ""}</div>
+                    </div>
+                    <div className="mt-2 text-slate-200 text-sm whitespace-pre-wrap">{h.transcript}</div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      </main>
+
+      <footer className="max-w-5xl mx-auto p-6 text-center text-xs text-slate-500">
+        Built with ❤️ — Deepgram / Supabase / Your backend
+      </footer>
     </div>
   );
-}
-
-async function uploadDirect(file) {
-  if (!file) return alert('No file selected');
-  const form = new FormData();
-  form.append('audio', file, file.name);
-
-  try {
-    const res = await axios.post('http://localhost:5000/api/transcribe', form, {
-      // do NOT set Content-Type here
-      timeout: 120000
-    });
-    console.log('Transcribe success:', res.data);
-    alert('Transcript: ' + (res.data.transcript || 'none'));
-  } catch (err) {
-    // verbose debug
-    console.error('Upload failed — full error:', err);
-    console.error('err.message:', err.message);
-    console.error('err.code:', err.code);
-    console.error('err.response?.status:', err?.response?.status);
-    console.error('err.response?.data:', err?.response?.data);
-    console.error('err.request:', err?.request); // if request was sent but no response
-    alert('Upload failed — check console for details');
-  }
 }
