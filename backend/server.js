@@ -1,3 +1,7 @@
+import cors from "cors";
+app.use(cors()); // allows all origins for now (ok for dev); later restrict to your frontend domain
+
+
 // backend/server.js (ES module)
 import express from "express";
 import cors from "cors";

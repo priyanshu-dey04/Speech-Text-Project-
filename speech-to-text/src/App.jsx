@@ -1,3 +1,8 @@
+import axios from "axios";
+
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:5000";
+
+
 import React, { useState, useRef, useEffect } from "react";
 import { supabase } from "./supabaseClient";
 import axios from "axios";
@@ -114,9 +119,17 @@ export default function App() {
       const token = sessData?.session?.access_token;
 
       // call backend transcribe route (replace with your backend url)
-      const res = await axios.post("http://localhost:5000/api/transcribe", { audioUrl: signed.signedUrl, storagePath: path }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await axios.post(
+  "https://speech-text-project.onrender.com/api/transcribe",
+  {
+    audioUrl: signed.signedUrl,
+    storagePath: path
+  },
+  {
+    headers: { "Content-Type": "application/json" }
+  }
+);
+
 
       setStatus({ type: "success", text: "Transcribed & saved." });
       // add to history quickly
