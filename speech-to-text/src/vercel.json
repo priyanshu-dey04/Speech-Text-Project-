@@ -10,7 +10,7 @@
   "routes": [
     {
       "src": "/api/(.*)",
-      "dest": "https://speech-text-project.onrender.com/api/$1"
+      "dest": "https://YOUR-RENDER-BACKEND.onrender.com/api/$1"
     },
     { "handle": "filesystem" },
     { "src": "/(.*)", "dest": "/index.html" }
